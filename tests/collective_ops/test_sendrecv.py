@@ -175,21 +175,19 @@ def test_sendrecv_grad_2():
 def test_sendrecv_jacfwd():
     from mpi4jax import sendrecv
 
-    arr = jnp.ones((3, 2)) * (rank + 1)
-    # _arr = arr.copy()
+    arr = jnp.ones((2,)) * (rank + 1)
+    _arr = arr.copy()
 
     other = 1 - rank
 
     def f(x):
         x, token = sendrecv(x, x, source=other, dest=other)
-        x = x * (rank + 1)
-        return x.sum()
+        return x
 
-    with pytest.raises(RuntimeError):
-        jax.jacfwd(f)(arr)
+    res = jax.jacfwd(f)(arr)
 
-    # assert jnp.array_equal(res, jnp.ones_like(arr) * (other + 1))
-    # assert jnp.array_equal(_arr, arr)
+    jnp.array_equal(res, jnp.identity(2))
+    assert jnp.array_equal(_arr, arr)
 
 
 @pytest.mark.skipif(size < 2 or rank > 1, reason="Runs only on rank 0 and 1")
@@ -210,3 +208,50 @@ def test_sendrecv_jacrev():
 
     assert jnp.array_equal(res, jnp.ones_like(arr) * (other + 1))
     assert jnp.array_equal(_arr, arr)
+
+
+@pytest.mark.skipif(size < 3, reason="Cannot differnetiate between source and destination for size 1 or 2")
+def test_sendrecv_jvp():
+    from mpi4jax import sendrecv
+
+    x = jnp.ones((2,)) * (rank + 1)
+    _x = x.copy()
+
+    dx = jnp.ones((2,)) * -1 * (rank + 1)
+
+    left = (rank - 1) % size
+    right = (rank + 1) % size
+
+    def f(x):
+        x, token = sendrecv(x, x, source=left, dest=right)
+        return x
+
+
+    y, dy = jax.jvp(f, (x,), (dx,))
+
+    assert jnp.array_equal(dy, jnp.ones_like(x) * -1 * (left + 1))
+    assert jnp.array_equal(_x, x)
+
+
+@pytest.mark.skipif(size < 3, reason="Cannot differnetiate between source and destination for size 1 or 2")
+def test_sendrecv_vjp():
+    from mpi4jax import sendrecv
+
+    x = jnp.ones((2,)) * (rank + 1)
+    _x = x.copy()
+
+    Dy = jnp.ones((2,)) * -1 * (rank + 1)
+
+    left = (rank - 1) % size
+    right = (rank + 1) % size
+
+    def f(x):
+        x, token = sendrecv(x, x, source=left, dest=right)
+        return x
+
+
+    _, vjp_f = jax.vjp(f, x)
+    Dx = vjp_f(Dy)[0]
+
+    assert jnp.array_equal(Dx, jnp.ones_like(x) * -1 * (right + 1))
+    assert jnp.array_equal(_x, x)
