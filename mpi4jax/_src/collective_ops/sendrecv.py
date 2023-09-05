@@ -20,6 +20,7 @@ from ..utils import (
     as_mhlo_constant,
     get_default_layouts,
     effect,
+    common_mpi_send_recv_vjp_tag,
 )
 from ..jax_compat import hlo_custom_call, token_type
 from ..decorators import translation_rule_cpu, translation_rule_gpu
@@ -124,17 +125,6 @@ def mpi_sendrecv_xla_encode_cpu(
 ):
     from ..xla_bridge.mpi_xla_bridge import MPI_STATUS_IGNORE_ADDR
 
-    # when performing forward diff, the gradient will follow the sent message.
-    # so if you do a sendrecv from rank 0 to 1, the gradient wrt the inputs of rank 0
-    # will end up in rank 1.\
-    # it's maybe possible to fix this by, at the end of the calculation, bringing back
-    # the gradient to the correct rank, but that would require some study.
-    if _must_transpose:
-        raise RuntimeError(
-            "sendrecv cannot be used with forward-mode (vjp) autodiff, because "
-            "the gradient might be located on a different mpi rank than the "
-            "desired one. Use reverse-mode (jvp) differentiation instead."
-        )
 
     comm = unpack_hashable(comm)
     status = unpack_hashable(status)
@@ -144,6 +134,7 @@ def mpi_sendrecv_xla_encode_cpu(
     recv_nptype = recv_aval.dtype
 
     send_type = ir.RankedTensorType(sendbuf.type)
+    send_dtype = send_type.element_type
     send_dims = send_type.shape
 
     recv_type = ir.RankedTensorType(recvbuf.type)
@@ -157,30 +148,52 @@ def mpi_sendrecv_xla_encode_cpu(
     recv_nitems = _np.prod(recv_dims, dtype=int)
     recv_dtype_handle = to_dtype_handle(recv_nptype)
 
-    out_types = [
-        ir.RankedTensorType.get(recv_dims, recv_dtype),
-        *token_type(),
-    ]
+    if _must_transpose:
+        out_types = [
+            ir.RankedTensorType.get(send_dims, send_dtype),
+            *token_type(),
+        ]
+    else: 
+        out_types = [
+            ir.RankedTensorType.get(recv_dims, recv_dtype),
+            *token_type(),
+        ]
 
     if status is None:
         status_ptr = _np.uintp(MPI_STATUS_IGNORE_ADDR)
     else:
         status_ptr = to_mpi_ptr(status)
 
-    operands = (
-        as_mhlo_constant(send_nitems, _np.intc),
-        sendbuf,
-        as_mhlo_constant(dest, _np.intc),
-        as_mhlo_constant(sendtag, _np.intc),
-        as_mhlo_constant(send_dtype_handle, _np.uintp),
-        as_mhlo_constant(recv_nitems, _np.intc),
-        as_mhlo_constant(source, _np.intc),
-        as_mhlo_constant(recvtag, _np.intc),
-        as_mhlo_constant(recv_dtype_handle, _np.uintp),
-        as_mhlo_constant(to_mpi_handle(comm), _np.uintp),
-        as_mhlo_constant(status_ptr, _np.uintp),
-        token,
-    )
+    if _must_transpose:
+        operands = (
+            as_mhlo_constant(recv_nitems, _np.intc),
+            recvbuf,
+            as_mhlo_constant(source, _np.intc),
+            as_mhlo_constant(recvtag, _np.intc),
+            as_mhlo_constant(recv_dtype_handle, _np.uintp),
+            as_mhlo_constant(send_nitems, _np.intc),
+            as_mhlo_constant(dest, _np.intc),
+            as_mhlo_constant(sendtag, _np.intc),
+            as_mhlo_constant(recv_dtype_handle, _np.uintp),
+            as_mhlo_constant(to_mpi_handle(comm), _np.uintp),
+            as_mhlo_constant(status_ptr, _np.uintp),
+            token,
+        )
+    else:
+        operands = (
+            as_mhlo_constant(send_nitems, _np.intc),
+            sendbuf,
+            as_mhlo_constant(dest, _np.intc),
+            as_mhlo_constant(sendtag, _np.intc),
+            as_mhlo_constant(send_dtype_handle, _np.uintp),
+            as_mhlo_constant(recv_nitems, _np.intc),
+            as_mhlo_constant(source, _np.intc),
+            as_mhlo_constant(recvtag, _np.intc),
+            as_mhlo_constant(recv_dtype_handle, _np.uintp),
+            as_mhlo_constant(to_mpi_handle(comm), _np.uintp),
+            as_mhlo_constant(status_ptr, _np.uintp),
+            token,
+        )
 
     return hlo_custom_call(
         b"mpi_sendrecv",
@@ -207,12 +220,6 @@ def mpi_sendrecv_xla_encode_gpu(
     _must_transpose=False,
 ):
 
-    if _must_transpose:
-        raise RuntimeError(
-            "sendrecv cannot be used with forward-mode (vjp) autodiff, because "
-            "the gradient might be located on a different mpi rank than the "
-            "desired one. Use reverse-mode (jvp) differentiation instead."
-        )
 
     from ..xla_bridge.mpi_xla_bridge import MPI_STATUS_IGNORE_ADDR
     from ..xla_bridge.mpi_xla_bridge_gpu import build_sendrecv_descriptor
@@ -225,6 +232,7 @@ def mpi_sendrecv_xla_encode_gpu(
     recv_nptype = recv_aval.dtype
 
     send_type = ir.RankedTensorType(sendbuf.type)
+    send_dtype = send_type.element_type
     send_dims = send_type.shape
 
     recv_type = ir.RankedTensorType(recvbuf.type)
@@ -238,33 +246,56 @@ def mpi_sendrecv_xla_encode_gpu(
     recv_nitems = _np.prod(recv_dims, dtype=int)
     recv_dtype_handle = to_dtype_handle(recv_nptype)
 
-    out_types = [
-        ir.RankedTensorType.get(recv_dims, recv_dtype),
-        *token_type(),
-    ]
+    if _must_transpose:
+        out_types = [
+            ir.RankedTensorType.get(send_dims, send_dtype),
+            *token_type(),
+        ]
+    else: 
+        out_types = [
+            ir.RankedTensorType.get(recv_dims, recv_dtype),
+            *token_type(),
+        ]
 
     if status is None:
         status_ptr = _np.uintp(MPI_STATUS_IGNORE_ADDR)
     else:
         status_ptr = to_mpi_ptr(status)
 
-    operands = (
-        sendbuf,
-        token,
-    )
-
-    descriptor = build_sendrecv_descriptor(
-        send_nitems,
-        dest,
-        sendtag,
-        send_dtype_handle,
-        recv_nitems,
-        source,
-        recvtag,
-        recv_dtype_handle,
-        to_mpi_handle(comm),
-        status_ptr,
-    )
+    if _must_transpose:
+        operands = (
+            recvbuf,
+            token,
+        )
+        descriptor = build_sendrecv_descriptor(
+            recv_nitems,
+            source,
+            recvtag,
+            recv_dtype_handle,
+            send_nitems,
+            dest,
+            sendtag,
+            send_dtype_handle,
+            to_mpi_handle(comm),
+            status_ptr,
+        )
+    else:
+        operands = (
+            sendbuf,
+            token,
+        )
+        descriptor = build_sendrecv_descriptor(
+            send_nitems,
+            dest,
+            sendtag,
+            send_dtype_handle,
+            recv_nitems,
+            source,
+            recvtag,
+            recv_dtype_handle,
+            to_mpi_handle(comm),
+            status_ptr,
+        )
 
     return hlo_custom_call(
         b"mpi_sendrecv",
@@ -365,7 +396,7 @@ def mpi_sendrecv_value_and_jvp(
         recvtag=recvtag,
         comm=comm,
         status=status,
-        _must_transpose=not _must_transpose,
+        _must_transpose=_must_transpose,
     )
 
     return (val, token), (jvp, ad.Zero.from_value(token_jvp))
@@ -384,11 +415,11 @@ def mpi_sendrecv_transpose_rule(
         token,
         source=dest,
         dest=source,
-        sendtag=sendtag,
-        recvtag=recvtag,
+        sendtag=common_mpi_send_recv_vjp_tag,
+        recvtag=common_mpi_send_recv_vjp_tag,
         comm=comm,
         status=status,
-        _must_transpose=not _must_transpose,
+        _must_transpose=_must_transpose,
     )
     return res, ad.Zero.from_value(res), token_tan
 

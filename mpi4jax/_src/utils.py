@@ -103,6 +103,7 @@ MPI_TYPE_MAP = {
     "bool": "BOOL",
 }
 
+common_mpi_send_recv_vjp_tag = 0xabcdef
 
 def to_dtype_handle(dtype):
     """
