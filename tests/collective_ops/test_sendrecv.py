@@ -210,7 +210,7 @@ def test_sendrecv_jacrev():
     assert jnp.array_equal(_arr, arr)
 
 
-@pytest.mark.skipif(size < 3, reason="Cannot differnetiate between source and destination for size 1 or 2")
+@pytest.mark.skipif(size < 3, reason="To ensure the source and destination combination are distinct on each process")
 def test_sendrecv_jvp():
     from mpi4jax import sendrecv
 
@@ -233,7 +233,7 @@ def test_sendrecv_jvp():
     assert jnp.array_equal(_x, x)
 
 
-@pytest.mark.skipif(size < 3, reason="Cannot differnetiate between source and destination for size 1 or 2")
+@pytest.mark.skipif(size < 3, reason="To ensure the source and destination combination are distinct on each process")
 def test_sendrecv_vjp():
     from mpi4jax import sendrecv
 
