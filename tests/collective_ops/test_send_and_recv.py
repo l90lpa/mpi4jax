@@ -97,7 +97,7 @@ def test_send_recv_deadlock():
     def deadlock(arr):
         if rank == 0:
             # send, then receive
-            token = send(arr, 1)
+            _, token = send(arr, 1)
             newarr, _ = recv(arr, 1, token=token)
         else:
             # receive, then send

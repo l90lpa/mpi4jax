@@ -9,6 +9,7 @@ from mpi4py.libmpi cimport (
     MPI_Datatype,
     MPI_Op,
     MPI_Status,
+    MPI_Type_size,
 )
 
 from . cimport mpi_xla_bridge
@@ -164,6 +165,13 @@ cdef void mpi_send_cpu(void** out_ptr, void** data_ptr) nogil:
     cdef MPI_Datatype dtype = <MPI_Datatype>((<uintptr_t*>(data_ptr[5]))[0])
 
     mpi_xla_bridge.mpi_send(sendbuf, nitems, dtype, destination, tag, comm)
+
+    cdef int ierr, dtype_size
+    cdef void* sendbuf_cpy = out_ptr[0]
+    if sendbuf_cpy != sendbuf:
+        ierr = MPI_Type_size(dtype, &dtype_size)
+        mpi_xla_bridge.abort_on_error(ierr, comm, u"Type_size")
+        memcpy(sendbuf_cpy, sendbuf, nitems * dtype_size)
 
 
 cdef void mpi_sendrecv_cpu(void** out_ptr, void** data_ptr) nogil:
