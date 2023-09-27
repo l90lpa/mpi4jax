@@ -5,7 +5,7 @@ from jax import abstract_arrays, core
 from jax.core import Primitive, Tracer, Token
 from jax.lax import create_token
 
-from jax.interpreters import mlir
+from jax.interpreters import mlir, ad
 import jaxlib.mlir.ir as ir
 
 from ..utils import (
@@ -18,6 +18,7 @@ from ..utils import (
     as_mhlo_constant,
     get_default_layouts,
     effect,
+    common_mpi_send_recv_vjp_tag,
 )
 from ..jax_compat import hlo_custom_call, token_type
 from ..decorators import translation_rule_cpu, translation_rule_gpu
@@ -161,10 +162,36 @@ def mpi_send_abstract_eval(xs, token, dest, tag, comm):
         core.abstract_token,
     ), {effect}
 
+def mpi_send_value_and_jvp(primal_args, tangent_args, dest, tag, comm):
+    
+    sendbuf, token = primal_args
+    sendbuf_tan, token_tan = tangent_args
+
+    sendbuf, token = mpi_send_p.bind(sendbuf, token, dest=dest, tag=tag, comm=comm)
+
+    # throw away return token to work around jax#6285
+    sendbuf_tan, token_tan = mpi_send_p.bind(sendbuf_tan, token, dest=dest, tag=tag, comm=comm)
+
+    return (sendbuf, token), (sendbuf_tan, ad.Zero.from_value(token_tan))
+
+
+def mpi_send_transpose_rule(cotan_args, *primal_args, dest, tag, comm):
+    from .recv import mpi_recv_p
+
+    _, token = primal_args
+    sendbuf_cot, token_cot = cotan_args
+
+    vjp, token = mpi_recv_p.bind(sendbuf_cot, token, source=dest, tag=common_mpi_send_recv_vjp_tag, comm=comm, status=None)
+
+    return vjp, token_cot
+
 
 mpi_send_p.multiple_results = True
 mpi_send_p.def_impl(mpi_send_impl)
 mpi_send_p.def_effectful_abstract_eval(mpi_send_abstract_eval)
+
+ad.primitive_jvps[mpi_send_p] = mpi_send_value_and_jvp
+ad.primitive_transposes[mpi_send_p] = mpi_send_transpose_rule
 
 # assign to the primitive the correct encoder
 mlir.register_lowering(mpi_send_p, mpi_send_xla_encode_cpu, platform="cpu")
