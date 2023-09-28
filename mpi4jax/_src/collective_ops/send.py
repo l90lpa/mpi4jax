@@ -1,11 +1,11 @@
 import numpy as _np
 from mpi4py import MPI as _MPI
 
-from jax import core
+from jax import abstract_arrays, core
 from jax.core import Primitive, Tracer, Token
 from jax.lax import create_token
 
-from jax.interpreters import mlir
+from jax.interpreters import mlir, ad
 import jaxlib.mlir.ir as ir
 
 from ..utils import (
@@ -18,6 +18,7 @@ from ..utils import (
     as_mhlo_constant,
     get_default_layouts,
     effect,
+    common_mpi_send_recv_vjp_tag,
 )
 from ..jax_compat import hlo_custom_call, token_type
 from ..decorators import translation_rule_cpu, translation_rule_gpu
@@ -50,7 +51,9 @@ def send(x, dest, *, tag=0, comm=None, token=None):
             If not given, a new token is generated.
 
     Returns:
-        Token: A new, modified token, that depends on this operation.
+        Tuple[DeviceArray, Token]:
+            - Copy of send buffer (returned to support differentiation).
+            - A new, modified token, that depends on this operation.
 
     """
     if token is None:
@@ -72,13 +75,17 @@ def mpi_send_xla_encode_cpu(ctx, x, token, dest, tag, comm):
     x_nptype = x_aval.dtype
 
     x_type = ir.RankedTensorType(x.type)
+    dtype = x_type.element_type
     dims = x_type.shape
 
     # compute total number of elements in array
     nitems = _np.prod(dims, dtype=int)
     dtype_handle = to_dtype_handle(x_nptype)
 
-    out_types = token_type()
+    out_types = [
+        ir.RankedTensorType.get(dims, dtype),
+        *token_type(),
+    ]
 
     operands = (
         as_mhlo_constant(nitems, _np.intc),
@@ -91,8 +98,7 @@ def mpi_send_xla_encode_cpu(ctx, x, token, dest, tag, comm):
     )
 
     # JAX insists on outputs being iterable
-    return [
-        hlo_custom_call(
+    return hlo_custom_call(
             b"mpi_send",
             out_types=out_types,
             operands=operands,
@@ -100,7 +106,6 @@ def mpi_send_xla_encode_cpu(ctx, x, token, dest, tag, comm):
             result_layouts=get_default_layouts(out_types),
             has_side_effect=True,
         )
-    ]
 
 
 @translation_rule_gpu
@@ -113,13 +118,17 @@ def mpi_send_xla_encode_gpu(ctx, x, token, dest, tag, comm):
     x_nptype = x_aval.dtype
 
     x_type = ir.RankedTensorType(x.type)
+    dtype = x_type.element_type
     dims = x_type.shape
 
     # compute total number of elements in array
     nitems = _np.prod(dims, dtype=int)
     dtype_handle = to_dtype_handle(x_nptype)
 
-    out_types = token_type()
+    out_types = [
+        ir.RankedTensorType.get(dims, dtype),
+        *token_type(),
+    ]
 
     operands = (
         x,
@@ -135,8 +144,7 @@ def mpi_send_xla_encode_gpu(ctx, x, token, dest, tag, comm):
     )
 
     # JAX insists on outputs being iterable
-    return [
-        hlo_custom_call(
+    return hlo_custom_call(
             b"mpi_send",
             out_types=out_types,
             operands=operands,
@@ -145,16 +153,45 @@ def mpi_send_xla_encode_gpu(ctx, x, token, dest, tag, comm):
             has_side_effect=True,
             backend_config=descriptor,
         )
-    ]
 
 
 # This function evaluates only the shapes during AST construction
 def mpi_send_abstract_eval(xs, token, dest, tag, comm):
-    return core.abstract_token, {effect}
+    return (
+        abstract_arrays.ShapedArray(xs.shape, xs.dtype),
+        core.abstract_token,
+    ), {effect}
+
+def mpi_send_value_and_jvp(primal_args, tangent_args, dest, tag, comm):
+    
+    sendbuf, token = primal_args
+    sendbuf_tan, token_tan = tangent_args
+
+    sendbuf, token = mpi_send_p.bind(sendbuf, token, dest=dest, tag=tag, comm=comm)
+
+    # throw away return token to work around jax#6285
+    sendbuf_tan, token_tan = mpi_send_p.bind(sendbuf_tan, token, dest=dest, tag=tag, comm=comm)
+
+    return (sendbuf, token), (sendbuf_tan, ad.Zero.from_value(token_tan))
 
 
+def mpi_send_transpose_rule(cotan_args, *primal_args, dest, tag, comm):
+    from .recv import mpi_recv_p
+
+    _, token = primal_args
+    sendbuf_cot, token_cot = cotan_args
+
+    vjp, token = mpi_recv_p.bind(sendbuf_cot, token, source=dest, tag=common_mpi_send_recv_vjp_tag, comm=comm, status=None)
+
+    return vjp, token_cot
+
+
+mpi_send_p.multiple_results = True
 mpi_send_p.def_impl(mpi_send_impl)
 mpi_send_p.def_effectful_abstract_eval(mpi_send_abstract_eval)
+
+ad.primitive_jvps[mpi_send_p] = mpi_send_value_and_jvp
+ad.primitive_transposes[mpi_send_p] = mpi_send_transpose_rule
 
 # assign to the primitive the correct encoder
 mlir.register_lowering(mpi_send_p, mpi_send_xla_encode_cpu, platform="cpu")
