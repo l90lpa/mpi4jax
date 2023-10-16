@@ -8,6 +8,7 @@ from jax.lax import create_token
 
 from jax.interpreters import mlir
 import jaxlib.mlir.ir as ir
+import jax.numpy as jnp
 
 from ..utils import (
     HashableMPIType,
@@ -41,11 +42,12 @@ mpi_sendrecv_impl = default_primitive_impl(mpi_sendrecv_p)
     recvtag=_np.integer,
     comm=(type(None), _MPI.Intracomm, HashableMPIType),
     status=(type(None), _MPI.Status, HashableMPIType),
-    token=(type(None), Token, Tracer),
+    # token=(type(None), Token, Tracer),
 )
 def sendrecv(
     sendbuf,
     recvbuf,
+    token,
     source,
     dest,
     *,
@@ -53,7 +55,6 @@ def sendrecv(
     recvtag=_MPI.ANY_TAG,
     comm=None,
     status=None,
-    token=None,
 ):
     """Perform a sendrecv operation.
 
@@ -65,6 +66,7 @@ def sendrecv(
         sendbuf: Array or scalar input to send.
         recvbuf: Array or scalar input with the correct shape and dtype. This can
            contain arbitrary data and will not be overwritten.
+        token (Array): an array used in the same manor as an 'XLA token' to ensure correct execution order.
         source (int): Rank of the source MPI process.
         dest (int): Rank of the destination MPI process.
         sendtag (int): Tag of this message for sending.
@@ -72,8 +74,6 @@ def sendrecv(
         comm (mpi4py.MPI.Comm): The MPI communicator to use (defaults to
             a clone of :obj:`COMM_WORLD`).
         status (mpi4py.MPI.Status): Status object, can be used for introspection.
-        token (Token): XLA token to use to ensure correct execution order.
-            If not given, a new token is generated.
 
     Returns:
         Tuple[DeviceArray, Token]:
@@ -81,8 +81,6 @@ def sendrecv(
             - A new, modified token, that depends on this operation.
 
     """
-    if token is None:
-        token = create_token(sendbuf)
 
     if comm is None:
         comm = get_default_comm()
@@ -148,15 +146,19 @@ def mpi_sendrecv_xla_encode_cpu(
     recv_nitems = _np.prod(recv_dims, dtype=int)
     recv_dtype_handle = to_dtype_handle(recv_nptype)
 
+    token_type = ir.RankedTensorType(token.type)
+    token_dtype = token_type.element_type
+    token_dims = token_type.shape
+
     if _must_transpose:
         out_types = [
             ir.RankedTensorType.get(send_dims, send_dtype),
-            *token_type(),
+            ir.RankedTensorType.get(token_dims, token_dtype),
         ]
     else: 
         out_types = [
             ir.RankedTensorType.get(recv_dims, recv_dtype),
-            *token_type(),
+            ir.RankedTensorType.get(token_dims, token_dtype),
         ]
 
     if status is None:
@@ -246,15 +248,19 @@ def mpi_sendrecv_xla_encode_gpu(
     recv_nitems = _np.prod(recv_dims, dtype=int)
     recv_dtype_handle = to_dtype_handle(recv_nptype)
 
+    token_type = ir.RankedTensorType(token.type)
+    token_dtype = token_type.element_type
+    token_dims = token_type.shape
+
     if _must_transpose:
         out_types = [
             ir.RankedTensorType.get(send_dims, send_dtype),
-            *token_type(),
+            ir.RankedTensorType.get(token_dims, token_dtype),
         ]
     else: 
         out_types = [
             ir.RankedTensorType.get(recv_dims, recv_dtype),
-            *token_type(),
+            ir.RankedTensorType.get(token_dims, token_dtype),
         ]
 
     if status is None:
@@ -323,7 +329,7 @@ def mpi_sendrecv_abstract_eval(
 ):
     return (
         abstract_arrays.ShapedArray(recvbuf.shape, recvbuf.dtype),
-        core.abstract_token,
+        abstract_arrays.ShapedArray(token.shape, token.dtype),
     ), {effect}
 
 
@@ -385,11 +391,14 @@ def mpi_sendrecv_value_and_jvp(
         _must_transpose=_must_transpose,
     )
 
-    # throw away return token to work around jax#6285
-    jvp, token_jvp = mpi_sendrecv_p.bind(
+    if isinstance(token_tan, ad.Zero):
+        token_tan = token
+    else:
+        token_tan = token_tan + token
+    jvp, token_tan = mpi_sendrecv_p.bind(
         send_tan,
         recv_tan,
-        token,
+        token_tan,
         source=source,
         dest=dest,
         sendtag=sendtag,
@@ -399,7 +408,7 @@ def mpi_sendrecv_value_and_jvp(
         _must_transpose=_must_transpose,
     )
 
-    return (val, token), (jvp, ad.Zero.from_value(token_jvp))
+    return (val, token), (jvp, token_tan)
 
 
 def mpi_sendrecv_transpose_rule(
@@ -408,11 +417,16 @@ def mpi_sendrecv_transpose_rule(
     _, _, token = x_args
     out_tan, token_tan = tan_args
 
+    if isinstance(token_tan, ad.Zero):
+        if isinstance(token, ad.UndefinedPrimal):
+            token_tan = jnp.zeros(token.aval.shape, token.aval.dtype)
+        else:
+            token_tan = jnp.zeros(token.shape, token.dtype)
     # swap the sender and receiver
-    res, token = mpi_sendrecv_p.bind(
+    res, token_tan = mpi_sendrecv_p.bind(
         out_tan,
         out_tan,
-        token,
+        token_tan,
         source=dest,
         dest=source,
         sendtag=common_mpi_send_recv_vjp_tag,

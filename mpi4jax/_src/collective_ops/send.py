@@ -7,6 +7,7 @@ from jax.lax import create_token
 
 from jax.interpreters import mlir, ad
 import jaxlib.mlir.ir as ir
+import jax.numpy as jnp
 
 from ..utils import (
     HashableMPIType,
@@ -36,28 +37,24 @@ mpi_send_impl = default_primitive_impl(mpi_send_p)
     dest=_np.integer,
     tag=_np.integer,
     comm=(type(None), _MPI.Intracomm, HashableMPIType),
-    token=(type(None), Token, Tracer),
+    # token=(type(None), Token, Tracer),
 )
-def send(x, dest, *, tag=0, comm=None, token=None):
+def send(x, token, dest, *, tag=0, comm=None):
     """Perform a send operation.
 
     Arguments:
         x: Array or scalar input to send.
+        token (Array): an array used in the same manor as an 'XLA token' to ensure correct execution order.
         dest (int): Rank of the destination MPI process.
         tag (int): Tag of this message.
         comm (mpi4py.MPI.Comm): The MPI communicator to use (defaults to
             a clone of :obj:`COMM_WORLD`).
-        token (Token): XLA token to use to ensure correct execution order.
-            If not given, a new token is generated.
 
     Returns:
-        Tuple[DeviceArray, Token]:
-            - Copy of send buffer (returned to support differentiation).
+        Tuple[Token]:
             - A new, modified token, that depends on this operation.
 
     """
-    if token is None:
-        token = create_token(x)
 
     if comm is None:
         comm = get_default_comm()
@@ -82,9 +79,12 @@ def mpi_send_xla_encode_cpu(ctx, x, token, dest, tag, comm):
     nitems = _np.prod(dims, dtype=int)
     dtype_handle = to_dtype_handle(x_nptype)
 
+    token_type = ir.RankedTensorType(token.type)
+    token_dtype = token_type.element_type
+    token_dims = token_type.shape
+
     out_types = [
-        ir.RankedTensorType.get(dims, dtype),
-        *token_type(),
+        ir.RankedTensorType.get(token_dims, token_dtype),
     ]
 
     operands = (
@@ -125,9 +125,12 @@ def mpi_send_xla_encode_gpu(ctx, x, token, dest, tag, comm):
     nitems = _np.prod(dims, dtype=int)
     dtype_handle = to_dtype_handle(x_nptype)
 
+    token_type = ir.RankedTensorType(token.type)
+    token_dtype = token_type.element_type
+    token_dims = token_type.shape
+
     out_types = [
-        ir.RankedTensorType.get(dims, dtype),
-        *token_type(),
+        ir.RankedTensorType.get(token_dims, token_dtype),
     ]
 
     operands = (
@@ -157,36 +160,36 @@ def mpi_send_xla_encode_gpu(ctx, x, token, dest, tag, comm):
 
 # This function evaluates only the shapes during AST construction
 def mpi_send_abstract_eval(xs, token, dest, tag, comm):
-    return (
-        abstract_arrays.ShapedArray(xs.shape, xs.dtype),
-        core.abstract_token,
-    ), {effect}
+    return abstract_arrays.ShapedArray(token.shape, token.dtype), {effect}
 
 def mpi_send_value_and_jvp(primal_args, tangent_args, dest, tag, comm):
     
     sendbuf, token = primal_args
     sendbuf_tan, token_tan = tangent_args
 
-    sendbuf, token = mpi_send_p.bind(sendbuf, token, dest=dest, tag=tag, comm=comm)
+    token = mpi_send_p.bind(sendbuf, token, dest=dest, tag=tag, comm=comm)
 
-    # throw away return token to work around jax#6285
-    sendbuf_tan, token_tan = mpi_send_p.bind(sendbuf_tan, token, dest=dest, tag=tag, comm=comm)
+    token_tan = token_tan + token
+    token_tan = mpi_send_p.bind(sendbuf_tan, token_tan, dest=dest, tag=tag, comm=comm)
 
-    return (sendbuf, token), (sendbuf_tan, ad.Zero.from_value(token_tan))
+    return token, token_tan
 
 
 def mpi_send_transpose_rule(cotan_args, *primal_args, dest, tag, comm):
     from .recv import mpi_recv_p
 
-    _, token = primal_args
-    sendbuf_cot, token_cot = cotan_args
+    sendbuf, token = primal_args
+    token_cot = cotan_args
 
-    vjp, token = mpi_recv_p.bind(sendbuf_cot, token, source=dest, tag=common_mpi_send_recv_vjp_tag, comm=comm, status=None)
+    if isinstance(sendbuf, ad.UndefinedPrimal):
+        zero_cot = jnp.zeros(sendbuf.aval.shape, sendbuf.aval.dtype)
+    else:
+        zero_cot = jnp.zeros(sendbuf.shape, sendbuf.dtype)
+    sendbuf_cot, token_cot = mpi_recv_p.bind(zero_cot, token_cot, source=dest, tag=common_mpi_send_recv_vjp_tag, comm=comm, status=None)
 
-    return vjp, token_cot
+    return sendbuf_cot, token_cot
 
 
-mpi_send_p.multiple_results = True
 mpi_send_p.def_impl(mpi_send_impl)
 mpi_send_p.def_effectful_abstract_eval(mpi_send_abstract_eval)
 

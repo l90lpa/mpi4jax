@@ -813,10 +813,6 @@ cdef void mpi_send_gpu(cudaStream_t stream, void** buffers,
     cdef void* data = buffers[0]
     cdef void* sendbuf = data
 
-    # get outputs
-    cdef void* data_cpy = buffers[2]
-
-
     if opaque_len != sizeof(SendDescriptor):
         with gil:
             raise RuntimeError("got wrong size of opaque argument")
@@ -843,11 +839,6 @@ cdef void mpi_send_gpu(cudaStream_t stream, void** buffers,
 
     if COPY_TO_HOST:
         free(sendbuf)
-
-    # On device copy of send buffer into output buffer
-    if data_cpy != data:
-        byte_count = dtype_size * nitems
-        checked_cuda_memcpy(data_cpy, data, byte_count, cudaMemcpyDeviceToDevice, comm)
 
 
 # Sendrecv
